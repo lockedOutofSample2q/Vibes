@@ -1,0 +1,221 @@
+// ============================================================
+//  Programming Inc. — Cold Email Auto-Drafter
+//  Reads from 'Leads' sheet, parses GEMINI output,
+//  creates Gmail drafts, and logs status back to sheet.
+// ============================================================
+const SHEET_NAME    = "Leads";
+const COL_EMAIL     = 1;  // Column A
+const COL_LINKEDIN  = 2;  // Column B
+const COL_GENERATED = 3;  // Column C
+const COL_SUBJECT   = 4;  // Column D
+const COL_STATUS    = 5;  // Column E
+const START_ROW     = 2;
+
+// ============================================================
+//  CORE DRAFT CREATOR — Builds proper MIME email via Gmail API
+// ============================================================
+function createMimeDraft(to, subject, plainTextBody, htmlSignature) {
+  const boundary = "mime_boundary_" + Utilities.getUuid().replace(/-/g, "");
+
+  // HTML body: plain text wrapped in pre-wrap div + raw signature appended untouched
+  const htmlBody =
+    "<html><body>" +
+    '<div style="font-family:Arial,sans-serif; font-size:14px; color:#1a1a1a; white-space:pre-wrap;">' +
+    plainTextBody +
+    "</div>" +
+    (htmlSignature || "") +
+    "</body></html>";
+
+  // Plain text version — body only, no signature (signature is HTML-only)
+  const fullPlain = plainTextBody;
+
+  const mimeMessage = [
+    `To: ${to}`,
+    `Subject: =?UTF-8?B?${Utilities.base64Encode(Utilities.newBlob(subject).getBytes())}?=`,
+    `MIME-Version: 1.0`,
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    ``,
+    `--${boundary}`,
+    `Content-Type: text/plain; charset="UTF-8"`,
+    `Content-Transfer-Encoding: 8bit`,
+    ``,
+    fullPlain,
+    ``,
+    `--${boundary}`,
+    `Content-Type: text/html; charset="UTF-8"`,
+    `Content-Transfer-Encoding: 8bit`,
+    ``,
+    htmlBody,
+    ``,
+    `--${boundary}--`
+  ].join("\r\n");
+
+  // Encode through newBlob().getBytes() to preserve special characters, accents, symbols
+  const encoded = Utilities.base64EncodeWebSafe(mimeMessage);
+
+  Gmail.Users.Drafts.create(
+    { message: { raw: encoded } },
+    "me"
+  );
+}
+
+// ============================================================
+//  MAIN FUNCTION — Draft all pending emails
+// ============================================================
+function draftAllColdEmails() {
+  const sheet   = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < START_ROW) {
+    SpreadsheetApp.getUi().alert("No leads found in the sheet.");
+    return;
+  }
+
+  const data      = sheet.getRange(START_ROW, 1, lastRow - START_ROW + 1, COL_STATUS).getValues();
+  const signature = getDefaultSignature();
+  let drafted = 0, skipped = 0, errors = 0;
+
+  data.forEach((row, i) => {
+    const sheetRow       = START_ROW + i;
+    const recipientEmail = String(row[COL_EMAIL - 1]).replace(/\s+/g, "").trim();
+    const generatedEmail = String(row[COL_GENERATED - 1]).trim();
+    const currentStatus  = String(row[COL_STATUS - 1]).trim();
+
+    if (currentStatus === "Drafted ✅") { skipped++; return; }
+
+    if (!recipientEmail || !generatedEmail || generatedEmail === "0") {
+      sheet.getRange(sheetRow, COL_STATUS).setValue("Skipped — No Data ⚠️");
+      skipped++;
+      return;
+    }
+
+    if (!isValidEmail(recipientEmail)) {
+      sheet.getRange(sheetRow, COL_STATUS).setValue("Error — Invalid Email ❌");
+      errors++;
+      return;
+    }
+
+    try {
+      const parsed      = parseGeminiOutput(generatedEmail);
+      const bestSubject = sheet.getRange(sheetRow, COL_SUBJECT).getValue().toString().trim() || "Quick question for you";
+      createMimeDraft(recipientEmail, bestSubject, parsed.body, signature);
+      sheet.getRange(sheetRow, COL_STATUS).setValue("Drafted ✅");
+      drafted++;
+    } catch (err) {
+      sheet.getRange(sheetRow, COL_STATUS).setValue(`Error ❌ — ${err.message}`);
+      errors++;
+      Logger.log(`Row ${sheetRow} failed: ${err.message}`);
+    }
+  });
+
+  SpreadsheetApp.getUi().alert(
+    `✅ Done!\n\nDrafted: ${drafted}\nSkipped: ${skipped}\nErrors: ${errors}\n\nCheck your Gmail Drafts folder.`
+  );
+}
+
+// ============================================================
+//  SINGLE ROW DRAFTER — Draft for the active row only
+// ============================================================
+function draftSelectedRowEmail() {
+  const sheet     = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const activeRow = sheet.getActiveCell().getRow();  // ← fixed: was referencing undefined 'sheetRow'
+
+  if (activeRow < START_ROW) {
+    SpreadsheetApp.getUi().alert("Please select a data row (not the header).");
+    return;
+  }
+
+  const recipientEmail = sheet.getRange(activeRow, COL_EMAIL).getValue().toString().replace(/\s+/g, "").trim();
+  const generatedEmail = sheet.getRange(activeRow, COL_GENERATED).getValue().toString().trim();
+
+  if (!recipientEmail || !generatedEmail) {
+    SpreadsheetApp.getUi().alert("Email or Generated Email is empty in this row.");
+    return;
+  }
+
+  try {
+    const parsed      = parseGeminiOutput(generatedEmail);
+    const bestSubject = sheet.getRange(activeRow, COL_SUBJECT).getValue().toString().trim() || "Quick question for you";  // ← fixed: was sheetRow
+    const signature   = getDefaultSignature();
+    createMimeDraft(recipientEmail, bestSubject, parsed.body, signature);
+    sheet.getRange(activeRow, COL_STATUS).setValue("Drafted ✅");
+    SpreadsheetApp.getUi().alert(`✅ Draft created for ${recipientEmail}\nSubject: ${bestSubject}`);
+  } catch (err) {
+    sheet.getRange(activeRow, COL_STATUS).setValue(`Error ❌ — ${err.message}`);
+    SpreadsheetApp.getUi().alert(`❌ Error: ${err.message}`);
+  }
+}
+
+// ============================================================
+//  PARSER — Extracts subject lines & body from GEMINI output
+// ============================================================
+function parseGeminiOutput(rawText) {
+  const lines     = rawText.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+  const subjects  = [];
+  const bodyLines = [];
+  let parsingBody = false;
+
+  lines.forEach(line => {
+    const subjectMatch = line.match(/^subject\s*(?:line\s*)?[abc]:\s*(.+)/i);
+    if (subjectMatch) {
+      subjects.push(subjectMatch[1].trim());
+    } else {
+      if (subjects.length > 0) parsingBody = true;
+      if (parsingBody) bodyLines.push(line);
+    }
+  });
+
+  if (bodyLines.length === 0) {
+    return { subjects: ["Quick question for you"], body: rawText.trim() };
+  }
+
+  return { subjects: subjects, body: bodyLines.join("\n\n") };
+}
+
+// ============================================================
+//  SIGNATURE FETCHER — Returns raw HTML signature exactly as-is
+// ============================================================
+function getDefaultSignature() {
+  try {
+    const sendAs        = Gmail.Users.Settings.SendAs.list("me").sendAs;
+    const defaultSendAs = sendAs.find(s => s.isDefault);
+    if (defaultSendAs && defaultSendAs.signature) {
+      return defaultSendAs.signature;  // raw HTML — never modified
+    }
+  } catch (err) {
+    Logger.log("Could not fetch signature: " + err.message);
+  }
+  return "";
+}
+
+// ============================================================
+//  CLEAR STATUSES — Resets Column E so you can re-draft
+// ============================================================
+function clearAllStatuses() {
+  const sheet   = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const lastRow = sheet.getLastRow();
+  if (lastRow >= START_ROW) {
+    sheet.getRange(START_ROW, COL_STATUS, lastRow - START_ROW + 1, 1).clearContent();
+    SpreadsheetApp.getUi().alert("All statuses cleared. You can re-draft now.");
+  }
+}
+
+// ============================================================
+//  UTILITY — Email validator
+// ============================================================
+function isValidEmail(email) {
+  const cleaned = email.replace(/\s+/g, "").trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleaned);
+}
+
+// ============================================================
+//  CUSTOM MENU
+// ============================================================
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("📧 Cold Email")
+    .addItem("Draft ALL Pending Emails", "draftAllColdEmails")
+    .addItem("Draft THIS Row Only",      "draftSelectedRowEmail")
+    .addSeparator()
+    .addItem("Clear All Statuses",       "clearAllStatuses")
+    .addToUi();
+}
