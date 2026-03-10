@@ -1,5 +1,5 @@
 // ============================================================
-//  Programming Inc. — Cold Email Auto-Drafter
+//  Google sheet — Cold Email Auto-Drafter
 //  Reads from 'Leads' sheet, parses GEMINI output,
 //  creates Gmail drafts, and logs status back to sheet.
 // ============================================================
